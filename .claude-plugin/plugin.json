@@ -1,0 +1,6 @@
+{
+  "name": "session-projects",
+  "version": "0.1.0",
+  "description": "A Projects pane that groups your Claude Code sessions by project and folder",
+  "types": "./types/index.d.ts"
+}
