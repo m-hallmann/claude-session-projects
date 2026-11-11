@@ -18,7 +18,8 @@ Each session's folder is stored the same way, as a `folder:<path>` tag (`folder:
 
 ## Commands
 
-- `/projects` opens the pane and refreshes it.
+- `/projects` opens the pane and refreshes it. Where the app doesn't draw plugin panels, it prints the grouped list as text instead, with links.
+- `/projects <word>` prints only the sessions whose title, project or folder matches.
 - `/file-under <name>` files the current session under a project. Without a name it opens the picker.
 
 ## Requirements

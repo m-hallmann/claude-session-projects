@@ -61,14 +61,14 @@ const STATUS: LoadStatus = {
   currentFolder: null,
 }
 
-function seed(on: On, ui: PaneUi = UI) {
+function seed(on: On, ui: PaneUi = UI, withClock = true) {
   const values: Record<string, unknown> = {
     sessions: { shape: 'sessions-1', value: SESSIONS },
     scans: { shape: 'scans-4', value: SCANS },
     ui: { shape: 'ui-1', value: ui },
     status: { shape: 'status-1', value: STATUS },
   }
-  on('clock.now', () => ({ value: Date.parse('2026-11-11T12:00:00Z') }))
+  if (withClock) on('clock.now', () => ({ value: Date.parse('2026-11-11T12:00:00Z') }))
   on('state.get', (_, e) => {
     const key = (e as { key: string }).key
     return { value: { value: values[key], version: 1 } }
@@ -217,4 +217,23 @@ test('on start the pane shows the list this machine saved last time', async ($, 
   expect(await ui.find({ type: 'Link', text: /Timer stops after resume/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Updated 3h/ })).toBeDefined()
   await ui.unmount()
+})
+
+const RUN = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 100 } }
+
+test('where no app draws the pane, /projects answers with the list as text', async ($, on) => {
+  seed(on, UI, false)
+  mock.clock(on, { now: Date.parse('2026-11-11T12:00:00Z') })
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'no-surface: no surface is attached' } }))
+
+  const { text } = await $.command.run({ command: 'projects', args: '', ...RUN })
+  expect(text).toContain('**Bird app** · `birdwatch` · 2')
+  expect(text).toContain('[Timer stops after resume](https://claude.ai/code/session_b)')
+  expect(text).toContain('this session')
+  expect(text).toContain('**Unsorted**')
+  expect(text).toContain("doesn't show plugin panels")
+
+  const filtered = await $.command.run({ command: 'projects', args: 'kiln', ...RUN })
+  expect(filtered.text).toContain('**kiln-app**')
+  expect(filtered.text).not.toContain('Bird app')
 })

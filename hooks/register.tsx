@@ -612,6 +612,41 @@ function dot(r: SessionRow): { glyph: string; color: string } {
   return { glyph: '○', color: 'inactive' }
 }
 
+/** The grouped list as markdown, for where no pane can be drawn. */
+async function listText($: $, query: string): Promise<string> {
+  const rows = await read($, sessions)
+  const all = await read($, scans)
+  const load = await read($, status)
+  const now = await $.clock.now()
+  const groups = applyFilter(
+    buildGroups(rows, all, { id: load.currentId, folder: load.currentFolder }),
+    'all',
+    query,
+  )
+  const head =
+    '**Projects**' +
+    (query ? ` matching "${query}"` : '') +
+    (load.fetchedAt ? ` · updated ${ago(new Date(load.fetchedAt).toISOString(), now)}` : '')
+  if (rows.length === 0) return head + '\n\nNo sessions yet.'
+  if (groups.length === 0) return head + '\n\nNothing matches.'
+  const lines = [head]
+  for (const g of groups) {
+    const folders = g.folders.filter(f => f.toLowerCase() !== g.name.toLowerCase())
+    lines.push('', `**${g.name}**${folders.length ? ` · \`${folders.join(', ')}\`` : ''} · ${g.rows.length}`)
+    const shown = query ? g.rows : g.rows.slice(0, ROWS_SHOWN)
+    for (const r of shown) {
+      const state = /WORKING/.test(r.bucket) ? 'working · ' : needsMe(r) ? 'needs you · ' : ''
+      const title = r.title.replace(/[[\]]/g, '')
+      const here = r.id === load.currentId ? ' · this session' : ''
+      lines.push(`- [${title}](https://claude.ai/code/${r.id}) · ${state}${ago(r.updated, now)}${here}`)
+    }
+    if (shown.length < g.rows.length) {
+      lines.push(`- …and ${g.rows.length - shown.length} more: \`/projects ${g.name}\``)
+    }
+  }
+  return lines.join('\n')
+}
+
 function isOpenByDefault(g: Group, index: number, currentId: string | null, now: number): boolean {
   if (g.rows.some(r => r.id === currentId)) return true
   if (index < 2 && !g.isUnsorted) return true
@@ -652,18 +687,35 @@ export const register: Register = on => {
       await update($, status, s => ({ ...s, fetchedAt: s.fetchedAt ?? fetchedAt }))
     }
 
+    // Drawn once an app that shows plugin panes is attached; until then it waits, open.
     void $.ui.open({ id: PANE, title: 'Projects' })
+    await $.store.delete('diag')
     $.clock.after(300, () => void refresh($))
     $.clock.every(REFRESH_MS, () => void refresh($))
 
     return next(e)
   })
 
-  on('command.run', { command: 'projects' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Projects' })
+  on('command.run', { command: 'projects' }, async ($, e) => {
+    const opened = await $.ui.open({ id: PANE, title: 'Projects' })
+    const query = e.args.trim()
+    if (opened.isPlaced && !query) {
+      $.clock.after(0, () => void refresh($))
+      return { text: 'Projects pane opened.' }
+    }
+    // No app here draws plugin panes: answer with the list as text.
+    if ((await read($, sessions)).length === 0) {
+      const rows = await fetchSessions($)
+      await update($, sessions, () => rows)
+    }
     $.clock.after(0, () => void refresh($))
-    return { text: 'Projects pane opened.' }
-  })
+    const note = opened.isPlaced
+      ? ''
+      : "\n\n_This app doesn't show plugin panels, so here is the list as text. `/projects <word>` filters it._"
+    return { text: (await listText($, query)) + note }
+  }).catch(($, e, next) =>
+    next.called ? next(e) : { text: "Couldn't load your sessions: the session service didn't answer." },
+  )
 
   on('command.run', { command: 'file-under' }, async ($, e) => {
     const { currentId } = await read($, status)
