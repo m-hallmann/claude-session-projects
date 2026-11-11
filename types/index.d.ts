@@ -13,7 +13,7 @@ export type SessionRow = {
 
 /** What a scan of one session's transcript found. */
 export type FolderScan = {
-  /** The folder the session worked in, normalized ("/d/vibe-coding/port2port"); null when none was found. */
+  /** The folder the session worked in, normalized ("/d/projects/birdwatch"); null when none was found. */
   folder: string | null
   /** Folders of absolute file paths the session touched, for matching against known folders. */
   paths: string[]

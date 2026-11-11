@@ -6,6 +6,11 @@ import type { Editing, Filter, FolderScan, LoadStatus, PaneUi, SessionRow } from
 const PANE = 'session-projects'
 const SERVER = 'claude-code-remote'
 const TAG = 'project:'
+/** Each session's folder, kept on the session so a fresh machine needn't scan it again. */
+const FOLDER_TAG = 'folder:'
+const NO_FOLDER = 'none'
+const MAX_TAG = 128
+const STORE_SESSIONS = 'sessions-1'
 const MAX_PAGES = 5
 const ROWS_SHOWN = 5
 const REFRESH_MS = 2 * 60 * 1000
@@ -102,7 +107,7 @@ async function fetchSessions($: $): Promise<SessionRow[]> {
 // ---------------------------------------------------------------------------
 // Folders
 
-/** "D:\\vibe-coding\\port2port" and "/d/vibe-coding/port2port/" both become "/d/vibe-coding/port2port". */
+/** "D:\\projects\\birdwatch" and "/d/projects/birdwatch/" both become "/d/projects/birdwatch". */
 function normPath(raw: string): string {
   let p = raw.replace(/\\/g, '/')
   const drive = /^([A-Za-z]):(\/|$)/.exec(p)
@@ -209,11 +214,12 @@ async function refresh($: $): Promise<void> {
     await update($, status, s => ({ ...s, isLoading: true, error: null }))
     const rows = await fetchSessions($)
     await update($, sessions, () => rows)
+    await saveSessions($)
 
     const { currentId } = await read($, status)
     const known = await read($, scans)
     const todo = rows.filter(r => {
-      if (r.id === currentId) return false
+      if (r.id === currentId || folderTagOf(r) !== undefined) return false
       const s = known[r.id]
       return !s || (s.folder === null && s.updated !== r.updated)
     })
@@ -240,8 +246,14 @@ async function refresh($: $): Promise<void> {
       }
     }
     await $.store.set(STORE_SCANS, await read($, scans))
+    try {
+      await cacheFolders($)
+    } catch (err) {
+      $.ui.log(`session-projects: folder tags not saved: ${String(err)}`)
+    }
     const now = await $.clock.now()
     await update($, status, s => ({ ...s, isLoading: false, fetchedAt: now, toScan: 0, scanned: 0 }))
+    await saveSessions($)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     await update($, status, s => ({
@@ -253,6 +265,58 @@ async function refresh($: $): Promise<void> {
     }))
   } finally {
     running = false
+  }
+}
+
+/** The folder a session's tag records: a path, null for "none found", undefined for no tag. */
+function folderTagOf(row: SessionRow): string | null | undefined {
+  const tag = row.tags.find(t => t.startsWith(FOLDER_TAG))
+  if (tag === undefined) return undefined
+  const value = tag.slice(FOLDER_TAG.length)
+  return value === NO_FOLDER || value === '' ? null : value
+}
+
+async function saveSessions($: $): Promise<void> {
+  const rows = await read($, sessions)
+  const { fetchedAt } = await read($, status)
+  await $.store.set(STORE_SESSIONS, { rows, fetchedAt })
+}
+
+/**
+ * Records each session's folder as a tag on the session, so the next fresh machine knows it without
+ * reading the session again. Archived sessions with no folder are marked "none"; open ones are left
+ * untagged, as they may still start working in one.
+ */
+async function cacheFolders($: $): Promise<void> {
+  const rows = await read($, sessions)
+  const all = await read($, scans)
+  const { currentId, currentFolder } = await read($, status)
+  const resolved = resolveFolders(rows, all, { id: currentId, folder: currentFolder })
+  const wanted = new Map<string, string[]>()
+  for (const r of rows) {
+    const folder = resolved.get(r.id) ?? null
+    const value = folder ?? (isArchived(r) ? NO_FOLDER : undefined)
+    if (value === undefined || (FOLDER_TAG + value).length > MAX_TAG) continue
+    if (r.tags.includes(FOLDER_TAG + value)) continue
+    wanted.set(value, [...(wanted.get(value) ?? []), r.id])
+  }
+  for (const [value, ids] of wanted) {
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50)
+      const remove = [
+        ...new Set(
+          rows.filter(r => chunk.includes(r.id)).flatMap(r => r.tags.filter(t => t.startsWith(FOLDER_TAG))),
+        ),
+      ]
+      await callText($, 'set_session_tags', { session_ids: chunk, add: [FOLDER_TAG + value], remove })
+      await update($, sessions, list =>
+        list.map(r =>
+          chunk.includes(r.id)
+            ? { ...r, tags: [...r.tags.filter(t => !t.startsWith(FOLDER_TAG)), FOLDER_TAG + value] }
+            : r,
+        ),
+      )
+    }
   }
 }
 
@@ -281,7 +345,7 @@ const GENERIC = new Set([
   'script', 'assets', 'public', 'build', 'dist', 'out', 'bin', 'packages', 'crates', 'reference',
 ])
 
-/** How Claude Code names a folder's own data dirs: "D:\\vibe-coding\\mesh editor" is "d--vibe-coding-mesh-editor". */
+/** How Claude Code names a folder's own data dirs: "D:\\projects\\tile studio" is "d--projects-tile-studio". */
 function folderKey(p: string): string {
   const drive = /^\/([a-z])(\/|$)/i.exec(p)
   const native = drive ? drive[1]!.toUpperCase() + ':' + p.slice(2) : p
@@ -347,9 +411,16 @@ function resolveFolders(
     return { r, scan, keys: keysOf(paths), dirs }
   })
 
+  const settled = new Set<string>()
   for (const { r, scan, keys, dirs } of facts) {
     if (r.id === current.id && current.folder) {
       out.set(r.id, current.folder)
+      continue
+    }
+    const tagged = folderTagOf(r)
+    if (tagged !== undefined) {
+      out.set(r.id, tagged)
+      settled.add(r.id)
       continue
     }
     let found: string | null = null
@@ -362,7 +433,7 @@ function resolveFolders(
   const sure = [...new Set([...out.values()].filter((f): f is string => f !== null))]
   const parents = [...new Set(sure.map(dirName))]
   for (const { r, keys, dirs } of facts) {
-    if (out.get(r.id)) continue
+    if (out.get(r.id) || settled.has(r.id)) continue
     let found: string | null = sure.find(f => keys.has(folderKey(f))) ?? null
     if (!found && dirs.length) {
       const votes: string[] = []
@@ -572,6 +643,14 @@ export const register: Register = on => {
     if (stored && typeof stored === 'object') {
       await update($, scans, all => ({ ...(stored as Record<string, FolderScan>), ...all }))
     }
+    // Start from the last list this machine saw; the refresh below brings it up to date.
+    const cached = (await $.store.get(STORE_SESSIONS)) as { rows?: unknown; fetchedAt?: unknown } | undefined
+    if (cached && Array.isArray(cached.rows) && (await read($, sessions)).length === 0) {
+      const rows = cached.rows as SessionRow[]
+      const fetchedAt = typeof cached.fetchedAt === 'number' ? cached.fetchedAt : null
+      await update($, sessions, () => rows)
+      await update($, status, s => ({ ...s, fetchedAt: s.fetchedAt ?? fetchedAt }))
+    }
 
     void $.ui.open({ id: PANE, title: 'Projects' })
     $.clock.after(300, () => void refresh($))
@@ -649,6 +728,8 @@ export const register: Register = on => {
     let note = ''
     if (load.error) note = load.error
     else if (load.isLoading && load.toScan > 0) note = `Finding folders ${load.scanned}/${load.toScan}…`
+    else if (load.isLoading && rows.length > 0 && load.fetchedAt)
+      note = `Updated ${ago(new Date(load.fetchedAt).toISOString(), now)} · refreshing…`
     else if (load.isLoading) note = 'Loading…'
     else if (load.fetchedAt) note = `Updated ${ago(new Date(load.fetchedAt).toISOString(), now)}`
 
