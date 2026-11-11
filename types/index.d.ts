@@ -9,6 +9,10 @@ export type SessionRow = {
   updated: string
   tags: string[]
   isUnread: boolean
+  /** Where the row came from: the cloud session list, or this computer's saved sessions. */
+  source?: 'cloud' | 'local'
+  /** For a session on this computer: the command that reopens it. */
+  resume?: string
 }
 
 /** What a scan of one session's transcript found. */
@@ -45,6 +49,10 @@ export type LoadStatus = {
   fetchedAt: number | null
   currentId: string | null
   currentFolder: string | null
+  /** cloud: read through the cloud session tools; local: from this computer's saved sessions. */
+  mode?: 'cloud' | 'local'
+  /** In a local session, why cloud sessions are missing, if they are. */
+  cloudNote?: string | null
 }
 
 declare module 'claude-code' {

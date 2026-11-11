@@ -212,7 +212,15 @@ async function refresh($: $): Promise<void> {
   running = true
   try {
     await update($, status, s => ({ ...s, isLoading: true, error: null }))
-    const rows = await fetchSessions($)
+    let rows: SessionRow[]
+    try {
+      rows = await fetchSessions($)
+    } catch (err) {
+      if (!isNotConnected(err)) throw err
+      await refreshLocal($)
+      return
+    }
+    await update($, status, s => ({ ...s, mode: 'cloud' as const, cloudNote: null }))
     await update($, sessions, () => rows)
     await saveSessions($)
 
@@ -259,13 +267,246 @@ async function refresh($: $): Promise<void> {
     await update($, status, s => ({
       ...s,
       isLoading: false,
-      error: /not connected|unknown server|no server|not found/i.test(message)
-        ? "This session can't read your session list (that needs a cloud session)."
-        : message.slice(0, 160),
+      error: message.slice(0, 160),
     }))
   } finally {
     running = false
   }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions on this computer, for a session without the cloud session tools
+
+const MAX_LOCAL_FILES = 200
+const MAX_READ = 4 * 1024 * 1024
+const STORE_LOCAL_INDEX = 'local-index-1'
+const STORE_LOCAL_PROJECTS = 'local-projects-1'
+const API = 'https://api.anthropic.com/v1/code/sessions'
+
+type LocalEntry = { mtimeMs: number; size: number; cwd: string | null; title: string | null }
+
+function isNotConnected(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err)
+  return /not connected|unknown (mcp )?server|no (such )?server|not found|nothing beneath the plugins answers mcp/i.test(m)
+}
+
+async function configDir($: $): Promise<string | null> {
+  const explicit = await $.env.get('CLAUDE_CONFIG_DIR')
+  if (explicit) return explicit.replace(/\\/g, '/').replace(/\/+$/, '')
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+  return home ? home.replace(/\\/g, '/').replace(/\/+$/, '') + '/.claude' : null
+}
+
+function clip(text: string): string {
+  const line = text.replace(/\s+/g, ' ').trim()
+  return line.length > 80 ? line.slice(0, 79) + '…' : line
+}
+
+/** What a saved transcript says about its session: the folder it ran in, and a title. */
+function readTranscript(text: string): { cwd: string | null; title: string | null } {
+  let cwd: string | null = null
+  let title: string | null = null
+  let first: string | null = null
+  for (const line of text.split('\n')) {
+    if (!line) continue
+    if (cwd && first && !line.includes('itle"') && !line.includes('"summary"')) continue
+    let o: Record<string, unknown>
+    try {
+      o = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    if (!cwd && typeof o.cwd === 'string' && o.cwd) cwd = o.cwd
+    const type = o.type
+    if (type === 'custom-title' || type === 'ai-title' || type === 'title' || type === 'summary') {
+      const v = o.customTitle ?? o.aiTitle ?? o.title ?? o.summary
+      if (typeof v === 'string' && v.trim()) title = v.trim()
+    }
+    if (!first) {
+      if (type === 'queue-operation' && o.operation === 'enqueue' && typeof o.content === 'string') {
+        first = o.content
+      } else if (type === 'user') {
+        const content = (o.message as { content?: unknown } | undefined)?.content
+        const text =
+          typeof content === 'string'
+            ? content
+            : Array.isArray(content)
+              ? (content.find(b => (b as { type?: string })?.type === 'text') as { text?: string } | undefined)?.text
+              : undefined
+        if (typeof text === 'string' && text.trim() && !text.trimStart().startsWith('<')) first = text
+      }
+    }
+  }
+  return { cwd, title: title ? clip(title) : first ? clip(first) : null }
+}
+
+/** Sessions Claude Code has saved on this computer, newest first, each with its exact folder. */
+async function fetchLocalSessions($: $): Promise<SessionRow[]> {
+  const dir = await configDir($)
+  if (!dir) return []
+  const root = dir + '/projects'
+  let projectDirs: { name: string; kind: string }[] = []
+  try {
+    projectDirs = (await $.fs.list(root)).filter(d => d.kind === 'dir')
+  } catch {
+    return []
+  }
+  const files: { path: string; id: string; dir: string; mtimeMs: number; size: number }[] = []
+  for (const d of projectDirs) {
+    let entries: { name: string; kind: string; size: number; mtimeMs: number }[] = []
+    try {
+      entries = await $.fs.list(root + '/' + d.name)
+    } catch {
+      continue
+    }
+    for (const f of entries) {
+      if (f.kind === 'file' && f.name.endsWith('.jsonl')) {
+        files.push({ path: `${root}/${d.name}/${f.name}`, id: f.name.slice(0, -6), dir: d.name, mtimeMs: f.mtimeMs, size: f.size })
+      }
+    }
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const seen = new Set<string>()
+  const chosen = files.filter(f => {
+    if (seen.has(f.id)) return false
+    seen.add(f.id)
+    return true
+  }).slice(0, MAX_LOCAL_FILES)
+
+  const index = ((await $.store.get(STORE_LOCAL_INDEX)) ?? {}) as Record<string, LocalEntry>
+  const todo = chosen.filter(f => {
+    const c = index[f.path]
+    return !c || c.mtimeMs !== f.mtimeMs || c.size !== f.size
+  })
+  await update($, status, s => ({ ...s, scanned: 0, toScan: todo.length }))
+  for (let i = 0; i < todo.length; i++) {
+    const f = todo[i]!
+    const entry: LocalEntry = { mtimeMs: f.mtimeMs, size: f.size, cwd: null, title: null }
+    if (f.size <= MAX_READ) {
+      try {
+        Object.assign(entry, readTranscript(await $.fs.read(f.path)))
+      } catch {
+        // unreadable: placed by its folder's other sessions below
+      }
+    }
+    index[f.path] = entry
+    if (i % 10 === 9 || i === todo.length - 1) await update($, status, s => ({ ...s, scanned: i + 1 }))
+  }
+  const kept: Record<string, LocalEntry> = {}
+  for (const f of chosen) if (index[f.path]) kept[f.path] = index[f.path]!
+  await $.store.set(STORE_LOCAL_INDEX, kept)
+
+  // Every transcript in one project dir ran in the same folder.
+  const dirCwd = new Map<string, string>()
+  for (const f of chosen) {
+    const c = kept[f.path]?.cwd
+    if (c && !dirCwd.has(f.dir)) dirCwd.set(f.dir, c)
+  }
+  const live = await liveSessions($, dir)
+  return chosen.map(f => {
+    const entry = kept[f.path]
+    const cwd = entry?.cwd ?? dirCwd.get(f.dir) ?? null
+    const folder = cwd ? normPath(cwd) : null
+    const date = ago(new Date(f.mtimeMs).toISOString(), f.mtimeMs + 8 * 24 * 3600 * 1000)
+    const state = live.get(f.id)
+    return {
+      id: 'local:' + f.id,
+      title: entry?.title ?? `Long session from ${date}`,
+      status: state ? 'SESSION_STATUS_RUNNING' : 'SESSION_STATUS_IDLE',
+      bucket: state === 'busy' ? 'SESSION_STATUS_BUCKET_WORKING' : 'SESSION_STATUS_BUCKET_COMPLETED',
+      updated: new Date(f.mtimeMs).toISOString(),
+      tags: [FOLDER_TAG + (folder && !isVague(folder) ? folder : NO_FOLDER)],
+      isUnread: false,
+      source: 'local' as const,
+      resume: cwd ? `cd "${cwd}" && claude --resume ${f.id}` : `claude --resume ${f.id}`,
+    }
+  })
+}
+
+/** Sessions running now on this computer, by id: Claude Code keeps a small file for each. */
+async function liveSessions($: $, dir: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  try {
+    for (const f of await $.fs.list(dir + '/sessions')) {
+      if (f.kind !== 'file' || !f.name.endsWith('.json')) continue
+      try {
+        const o = JSON.parse(await $.fs.read(`${dir}/sessions/${f.name}`)) as { sessionId?: unknown; status?: unknown }
+        if (typeof o.sessionId === 'string') out.set(o.sessionId, typeof o.status === 'string' ? o.status : 'idle')
+      } catch {
+        // a session that just ended
+      }
+    }
+  } catch {
+    // no running sessions recorded
+  }
+  return out
+}
+
+/** Your cloud sessions, read with this computer's login; Remote Control ones are already local. */
+async function fetchCloudViaApi($: $): Promise<{ rows: SessionRow[]; note: string | null }> {
+  const auth = await $.session.authorize()
+  if (!auth) return { rows: [], note: 'Cloud sessions need a claude.ai login.' }
+  const rows: SessionRow[] = []
+  let after: string | undefined
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const url = `${API}?limit=100` + (after ? `&after_id=${encodeURIComponent(after)}` : '')
+    const r = await $.http.fetch(url, {
+      auth: auth.handle,
+      headers: { 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29' },
+    })
+    if (!r.ok) {
+      return { rows, note: rows.length ? null : `Cloud sessions aren't available with this login (${r.status}).` }
+    }
+    const body = JSON.parse(r.text) as Ccr
+    const data = Array.isArray(body.data) ? (body.data as Ccr[]) : []
+    for (const s of data) {
+      if (typeof s.id !== 'string') continue
+      const kind = String(s.environment_kind ?? (s.environment as Ccr | undefined)?.kind ?? '')
+      if (/bridge/i.test(kind)) continue
+      rows.push({
+        id: 'session_' + s.id.replace(/^(cse|session)_/, ''),
+        title: typeof s.title === 'string' && s.title ? s.title : 'Untitled session',
+        status: String(s.session_status ?? s.status ?? ''),
+        bucket: String(s.status_bucket ?? ''),
+        updated: String(s.updated_at ?? s.last_event_at ?? s.created_at ?? ''),
+        tags: Array.isArray(s.tags) ? s.tags.filter((t): t is string => typeof t === 'string') : [],
+        isUnread: s.unread === true,
+        source: 'cloud',
+      })
+    }
+    if (body.has_more !== true || typeof body.last_id !== 'string' || body.last_id === after) break
+    after = body.last_id
+  }
+  return { rows, note: null }
+}
+
+function withProject(row: SessionRow, name: string): SessionRow {
+  return { ...row, tags: [...row.tags.filter(t => !t.startsWith(TAG)), ...(name ? [TAG + name] : [])] }
+}
+
+async function refreshLocal($: $): Promise<void> {
+  const local = await fetchLocalSessions($)
+  let cloud: SessionRow[] = []
+  let note: string | null = null
+  try {
+    ;({ rows: cloud, note } = await fetchCloudViaApi($))
+  } catch {
+    note = "Cloud sessions couldn't be read from this computer."
+  }
+  const assigned = ((await $.store.get(STORE_LOCAL_PROJECTS)) ?? {}) as Record<string, string>
+  const rows = [...cloud, ...local].map(r => (r.id in assigned ? withProject(r, assigned[r.id]!) : r))
+  await update($, sessions, () => rows)
+  const now = await $.clock.now()
+  await update($, status, s => ({
+    ...s,
+    isLoading: false,
+    fetchedAt: now,
+    toScan: 0,
+    scanned: 0,
+    mode: 'local' as const,
+    cloudNote: note,
+  }))
+  await saveSessions($)
 }
 
 /** The folder a session's tag records: a path, null for "none found", undefined for no tag. */
@@ -548,12 +789,18 @@ async function fileSessions($: $, ids: string[], name: string): Promise<void> {
     ...new Set(chosen.flatMap(r => r.tags.filter(t => t.startsWith(TAG) && t !== TAG + clean))),
   ]
   const add = clean ? [TAG + clean] : []
-  for (let i = 0; i < ids.length; i += 50) {
-    await callText($, 'set_session_tags', {
-      session_ids: ids.slice(i, i + 50),
-      add,
-      remove,
-    })
+  if ((await read($, status)).mode === 'local') {
+    const assigned = ((await $.store.get(STORE_LOCAL_PROJECTS)) ?? {}) as Record<string, string>
+    for (const id of ids) assigned[id] = clean
+    await $.store.set(STORE_LOCAL_PROJECTS, assigned)
+  } else {
+    for (let i = 0; i < ids.length; i += 50) {
+      await callText($, 'set_session_tags', {
+        session_ids: ids.slice(i, i + 50),
+        add,
+        remove,
+      })
+    }
   }
   await update($, sessions, list =>
     list.map(r =>
@@ -565,6 +812,12 @@ async function fileSessions($: $, ids: string[], name: string): Promise<void> {
   await update($, ui, u => ({ ...u, editing: null }))
   const n = ids.length === 1 ? 'Session' : `${ids.length} sessions`
   $.ui.toast(clean ? `${n} filed under ${clean}` : `${n} removed from its project`)
+}
+
+/** Copies the command that reopens a session on this computer. */
+async function copyResume($: $, command: string, surface: string): Promise<void> {
+  const copied = await $.ui.copy({ text: command, surface: surface as never })
+  $.ui.toast(copied.isCopied ? 'Copied. Paste it in a terminal to resume.' : command)
 }
 
 async function fileSafely($: $, ids: string[], name: string): Promise<void> {
@@ -638,7 +891,11 @@ async function listText($: $, query: string): Promise<string> {
       const state = /WORKING/.test(r.bucket) ? 'working · ' : needsMe(r) ? 'needs you · ' : ''
       const title = r.title.replace(/[[\]]/g, '')
       const here = r.id === load.currentId ? ' · this session' : ''
-      lines.push(`- [${title}](https://claude.ai/code/${r.id}) · ${state}${ago(r.updated, now)}${here}`)
+      lines.push(
+        r.resume
+          ? `- ${title} · ${state}${ago(r.updated, now)}${here} · \`${r.resume}\``
+          : `- [${title}](https://claude.ai/code/${r.id}) · ${state}${ago(r.updated, now)}${here}`,
+      )
     }
     if (shown.length < g.rows.length) {
       lines.push(`- …and ${g.rows.length - shown.length} more: \`/projects ${g.name}\``)
@@ -669,7 +926,9 @@ export const register: Register = on => {
     }
 
     const remoteId = await $.env.get('CLAUDE_CODE_REMOTE_SESSION_ID')
-    const currentId = remoteId ? 'session_' + remoteId.replace(/^(cse|session)_/, '') : null
+    const currentId = remoteId
+      ? 'session_' + remoteId.replace(/^(cse|session)_/, '')
+      : 'local:' + (await $.session.id())
     const cwd = normPath(e.cwd || (await $.session.cwd()))
     await update($, status, s => ({ ...s, currentId, currentFolder: isVague(cwd) ? null : cwd }))
 
@@ -705,8 +964,14 @@ export const register: Register = on => {
     }
     // No app here draws plugin panes: answer with the list as text.
     if ((await read($, sessions)).length === 0) {
-      const rows = await fetchSessions($)
-      await update($, sessions, () => rows)
+      try {
+        const rows = await fetchSessions($)
+        await update($, sessions, () => rows)
+      } catch (err) {
+        if (!isNotConnected(err)) throw err
+        $.clock.after(0, () => void refresh($))
+        return { text: 'Reading the sessions saved on this computer for the first time. Run `/projects` again in a few seconds.' }
+      }
     }
     $.clock.after(0, () => void refresh($))
     const note = opened.isPlaced
@@ -807,6 +1072,12 @@ export const register: Register = on => {
           </Text>
           <Button key="refresh" label="Refresh" plain dimColor onPress={() => void refresh($)} />
         </Box>
+
+        {load.mode === 'local' && (
+          <Text size="caption" dimColor>
+            {'Sessions on this computer' + (load.cloudNote ? '. ' + load.cloudNote : ', and your cloud sessions.')}
+          </Text>
+        )}
 
         {load.currentId && (
           <Box flexDirection="column" borderStyle="round" borderColor="claude" paddingX="sm" paddingY="xs">
@@ -924,7 +1195,11 @@ export const register: Register = on => {
                         <Box key={'row-' + r.id} flexDirection="row" alignItems="center" gap="xs" paddingLeft="md">
                           <Text color={d.color}>{d.glyph}</Text>
                           <Box flexGrow={1} flexShrink={1}>
-                            <Link href={'https://claude.ai/code/' + r.id} label={r.title} />
+                            {r.source === 'local' ? (
+                              <Text wrap="truncate-end">{r.title}</Text>
+                            ) : (
+                              <Link href={'https://claude.ai/code/' + r.id} label={r.title} />
+                            )}
                           </Box>
                           {isHere && (
                             <Text size="caption" dimColor>
@@ -932,6 +1207,15 @@ export const register: Register = on => {
                             </Text>
                           )}
                           {r.isUnread && <Text color="claude">•</Text>}
+                          {r.resume && !isHere && (
+                            <Button
+                              key={'resume-' + r.id}
+                              label="Resume"
+                              plain
+                              dimColor
+                              onPress={() => void copyResume($, r.resume!, e.surface)}
+                            />
+                          )}
                           {!isHere && (
                             <Box {...reveal}>
                               <Button

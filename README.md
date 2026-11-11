@@ -22,9 +22,12 @@ Each session's folder is stored the same way, as a `folder:<path>` tag (`folder:
 - `/projects <word>` prints only the sessions whose title, project or folder matches.
 - `/file-under <name>` files the current session under a project. Without a name it opens the picker.
 
-## Requirements
+## Where it gets your sessions
 
-It reads your session list through the `claude-code-remote` tools that cloud sessions have. In a session without them the pane says so.
+- **In a cloud session** it reads your session list through the session tools cloud sessions have, and links each session to claude.ai.
+- **In a session on your computer** (a terminal, or a local session in the desktop app) it reads the sessions Claude Code has saved there, in `~/.claude/projects`, including Remote Control sessions. Each one's folder comes straight from its transcript. These rows have a **Resume** button that copies the command to reopen the session. It also asks Anthropic for your cloud sessions with your login and adds them with their links; if your login can't read them, the pane says so. Project names you give there are kept on that computer.
+
+Panels are drawn in a terminal and in the desktop app's local sessions. An app that doesn't draw plugin panels still gets the list as text from `/projects`.
 
 ## Install
 

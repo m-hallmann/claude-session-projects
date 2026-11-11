@@ -1,4 +1,4 @@
-import type { On } from 'claude-code'
+import type { FsEntry, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import type { FolderScan, LoadStatus, PaneUi, SessionRow } from '../types'
@@ -236,4 +236,83 @@ test('where no app draws the pane, /projects answers with the list as text', asy
   const filtered = await $.command.run({ command: 'projects', args: 'kiln', ...RUN })
   expect(filtered.text).toContain('**kiln-app**')
   expect(filtered.text).not.toContain('Bird app')
+})
+
+test('in a session without the cloud tools, the pane lists this computer\'s sessions by folder', async ($, on) => {
+  const now = Date.parse('2026-11-11T12:00:00Z')
+  const clock = mock.clock(on, { now })
+  mock.env(on, { HOME: '/home/me' })
+  mock.store(on, {})
+  on('session.id', () => ({ value: 'cur' }))
+  on('session.authorize', () => ({ value: null }))
+  on('mcp.call', () => ({
+    value: { content: [{ type: 'text', text: 'MCP server "claude-code-remote" is not connected' }], isError: true },
+  }))
+  on('command.register', (_, e) => ({ value: { command: (e as { name: string }).name } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  const line = (o: object) => JSON.stringify(o)
+  const bird = 'D:\\projects\\birdwatch'
+  const tile = 'D:\\projects\\tile studio'
+  const root = '/home/me/.claude/projects'
+  const file = (name: string, size: number, minutesAgo: number) => ({
+    name, kind: 'file' as const, size, mtimeMs: now - minutesAgo * 60000, isLink: false,
+  })
+  const dirs: Record<string, FsEntry[]> = {
+    [root]: [
+      { name: 'D--projects-birdwatch', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+      { name: 'D--projects-tile-studio', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+    ],
+    [root + '/D--projects-birdwatch']: [file('cur.jsonl', 900, 1), file('a.jsonl', 900, 60), file('b.jsonl', 900, 120)],
+    [root + '/D--projects-tile-studio']: [file('c.jsonl', 5 * 1024 * 1024, 30), file('d.jsonl', 900, 600)],
+    '/home/me/.claude/sessions': [file('101.json', 100, 0)],
+  }
+  const texts: Record<string, string> = {
+    [root + '/D--projects-birdwatch/cur.jsonl']: line({ type: 'user', cwd: bird, message: { content: 'Group my sessions' } }),
+    [root + '/D--projects-birdwatch/a.jsonl']: [
+      line({ type: 'queue-operation', operation: 'enqueue', content: 'Fix the login redirect bug please' }),
+      line({ type: 'user', cwd: bird, message: { content: 'Fix the login redirect bug please' } }),
+    ].join('\n'),
+    [root + '/D--projects-birdwatch/b.jsonl']: [
+      line({ type: 'user', cwd: bird, message: { content: [{ type: 'text', text: '<command-name>/clear</command-name>' }] } }),
+      line({ type: 'user', cwd: bird, message: { content: [{ type: 'text', text: 'why does the timer stop' }] } }),
+      line({ type: 'custom-title', customTitle: 'Timer stops after resume' }),
+    ].join('\n'),
+    [root + '/D--projects-tile-studio/d.jsonl']: line({ type: 'user', cwd: tile, message: { content: 'Pick a UI kit' } }),
+    '/home/me/.claude/sessions/101.json': JSON.stringify({ sessionId: 'cur', status: 'busy' }),
+  }
+  on('fs.list', (_, e) => ({ value: dirs[(e as { path: string }).path] ?? [] }))
+  on('fs.read', (_, e) => {
+    const text = texts[(e as { path: string }).path]
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+
+  await $.session.start({ cwd: bird, surface: 'desktop', isInteractive: true })
+  await clock.advance(1000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^birdwatch$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^tile studio$/ })).toBeDefined()
+  // Titles: the saved title, else the first real prompt; a transcript too big to read keeps its folder.
+  expect(await ui.find({ type: 'Text', text: /^Timer stops after resume$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Fix the login redirect bug please$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Long session from/ })).toBeDefined()
+  expect(await ui.find({ key: 'resume-local:a' })).toBeDefined()
+  expect(await ui.find({ key: 'resume-local:cur' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Sessions on this computer\. Cloud sessions need a claude\.ai login\./ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Unsorted$/ })).toBeUndefined()
+  await ui.unmount()
+
+  // Filing in a local session is kept on this computer.
+  const filed = await $.command.run({ command: 'file-under', args: 'Bird app', ...RUN })
+  expect(filed.text).toContain('Bird app')
+  const after = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await after.find({ type: 'Text', text: /^Bird app$/ })).toBeDefined()
+  await after.unmount()
+
+  // The text list carries the resume command where there is no link.
+  const listed = await $.command.run({ command: 'projects', args: 'tile', ...RUN })
+  expect(listed.text).toContain('`cd "D:\\projects\\tile studio" && claude --resume d`')
 })
